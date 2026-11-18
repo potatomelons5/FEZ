@@ -1,0 +1,473 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FEZ</title>
+  <base href="https://cdn.jsdelivr.net/gh/degloved-net/FEZ@main/FEZ/" />
+  <link
+          rel="icon"
+          href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23000'/%3E%3Cpath fill='%23f0c040' d='M7 7h18v5H13v4h10v5H13v4H7z'/%3E%3C/svg%3E"
+  />
+
+  <style>
+    *,
+    *::before,
+    *::after {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+    }
+
+    #loading {
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 1rem;
+      color: #fff;
+      font: 1.2rem/1.4 monospace;
+    }
+
+    #loading.hidden {
+      display: none;
+    }
+
+    #status {
+      text-align: center;
+    }
+
+    #status-text {
+      margin-bottom: 8px;
+    }
+
+    #progress-bar {
+      width: 300px;
+      height: 6px;
+      margin: 0 auto;
+      overflow: hidden;
+      background: #333;
+      border-radius: 999px;
+    }
+
+    #progress-fill {
+      width: 0%;
+      height: 100%;
+      background: #f0c040;
+      transition: width 0.2s ease;
+    }
+
+    #detail {
+      margin-top: 8px;
+      color: #888;
+      font-size: 0.75rem;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+
+<body>
+<div id="loading">
+  <div id="status">
+    <div id="status-text">Loading...</div>
+    <div id="progress-bar">
+      <div id="progress-fill"></div>
+    </div>
+    <div id="detail"></div>
+  </div>
+</div>
+
+<canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+
+<script>
+  const nativeFetch = window.fetch.bind(window);
+
+  window.fetch = function (resource, options = {}) {
+    return nativeFetch(resource, {
+      ...options,
+      credentials: "omit"
+    });
+  };
+
+  // keep browser from stealing fucking keys mid game
+  const BLOCKED_KEYS = new Set([
+    "Tab",
+    "Escape",
+    "Space",
+    " ",
+    "ArrowUp",
+    "ArrowDown",
+    "ArrowLeft",
+    "ArrowRight",
+    "F1",
+    "F2",
+    "F3",
+    "F4",
+    "F5",
+    "F6",
+    "F7",
+    "F8",
+    "F9",
+    "F10",
+    "F11",
+    "F12"
+  ]);
+
+  function blockGameKeys(event) {
+    if (BLOCKED_KEYS.has(event.key) || BLOCKED_KEYS.has(event.code)) {
+      event.preventDefault();
+    }
+  }
+
+  window.addEventListener("keydown", blockGameKeys);
+  window.addEventListener("keyup", blockGameKeys);
+
+  (() => {
+    const originalGetDirectory =
+            navigator.storage?.getDirectory?.bind(navigator.storage) ?? null;
+
+    let dbPromise = null;
+
+    function openDatabase() {
+      return new Promise((resolve, reject) => {
+        const req = indexedDB.open("fez-opfs-polyfill", 1);
+
+        req.onupgradeneeded = () => {
+          req.result.createObjectStore("files");
+        };
+
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function getDatabase() {
+      if (!dbPromise) {
+        dbPromise = openDatabase();
+      }
+
+      return dbPromise;
+    }
+
+    function readFile(db, key) {
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("files", "readonly");
+        const req = tx.objectStore("files").get(key);
+
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function writeFile(db, key, value) {
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction("files", "readwrite");
+        const req = tx.objectStore("files").put(value, key);
+
+        req.onsuccess = () => resolve();
+        req.onerror = () => reject(req.error);
+      });
+    }
+
+    function createWritableFile(db, name) {
+      const chunks = [];
+
+      return {
+        write(data) {
+          const normalized =
+                  data instanceof Uint8Array ? data.slice() : new Uint8Array(data);
+
+          chunks.push(normalized);
+          return Promise.resolve();
+        },
+
+        close() {
+          let totalLength = 0;
+          for (const chunk of chunks) totalLength += chunk.length;
+
+          const merged = new Uint8Array(totalLength);
+          let offset = 0;
+
+          for (const chunk of chunks) {
+            merged.set(chunk, offset);
+            offset += chunk.length;
+          }
+
+          return writeFile(db, name, merged);
+        }
+      };
+    }
+
+    function createFakeRoot(db) {
+      return {
+        getFileHandle(name, options) {
+          if (options?.create) {
+            return Promise.resolve({
+              getFile() {
+                return readFile(db, name).then((data) => {
+                  return new Blob([data || new Uint8Array(0)]);
+                });
+              },
+
+              createWritable() {
+                return Promise.resolve(createWritableFile(db, name));
+              }
+            });
+          }
+
+          return readFile(db, name).then((data) => {
+            if (data === undefined) {
+              throw new DOMException("Not found", "NotFoundError");
+            }
+
+            return {
+              getFile() {
+                return Promise.resolve(new Blob([data]));
+              },
+
+              createWritable() {
+                return Promise.resolve(createWritableFile(db, name));
+              }
+            };
+          });
+        }
+      };
+    }
+
+    if (navigator.storage) {
+      navigator.storage.getDirectory = function () {
+        if (originalGetDirectory) {
+          return originalGetDirectory().catch(() => {
+            return getDatabase().then(createFakeRoot);
+          });
+        }
+
+        return getDatabase().then(createFakeRoot);
+      };
+    }
+  })();
+</script>
+
+<script type="module">
+  (async () => {
+    const BASE = document.querySelector("base").href;
+    const loadingEl = document.getElementById("loading");
+    const canvas = document.getElementById("canvas");
+    const statusTextEl = document.getElementById("status-text");
+    const progressFillEl = document.getElementById("progress-fill");
+    const detailEl = document.getElementById("detail");
+
+    const CONTENT_FILES = [
+      {
+        url: "content/Essentials.pak",
+        dest: "/Content/Essentials.pak",
+        label: "Essentials.pak"
+      },
+      {
+        url: "content/Updates.pak",
+        dest: "/Content/Updates.pak",
+        label: "Updates.pak"
+      },
+      {
+        url: "content/Sounds/SoundLevels.sdl",
+        dest: "/Content/Sounds/SoundLevels.sdl",
+        label: "SoundLevels.sdl"
+      },
+      {
+        url: "content/Other.pak",
+        dest: "/Content/Other.pak",
+        label: "Other.pak"
+      },
+      {
+        url: "content/gamecontrollerdb.txt",
+        dest: "/gamecontrollerdb.txt",
+        label: "gamecontrollerdb.txt"
+      },
+      {
+        url: "content/Music.pak",
+        dest: "/Content/Music.pak",
+        label: "Music.pak"
+      }
+    ];
+
+    canvas.focus();
+
+    function setStatus(message, percent, detail = "") {
+      statusTextEl.textContent = message;
+
+      if (percent !== undefined) {
+        progressFillEl.style.width = `${percent}%`;
+      }
+
+      detailEl.textContent = detail;
+    }
+
+    function formatSize(bytes) {
+      if (bytes >= 1048576) return `${(bytes / 1048576).toFixed(1)} MB`;
+      if (bytes >= 1024) return `${Math.round(bytes / 1024)} KB`;
+      return `${bytes} B`;
+    }
+
+    async function downloadChunkedFile(baseUrl, onProgress) {
+      const countResponse = await fetch(`${baseUrl}.count`);
+      if (!countResponse.ok) {
+        throw new Error(`Failed to fetch ${baseUrl}.count: ${countResponse.status}`);
+      }
+
+      const chunkCount = parseInt(await countResponse.text(), 10);
+      const chunks = [];
+      let totalBytes = 0;
+
+      for (let i = 0; i < chunkCount; i++) {
+        const chunkUrl = `${baseUrl}${String(i).padStart(2, "0")}`;
+        const response = await fetch(chunkUrl);
+
+        if (!response.ok) {
+          throw new Error(`Failed to fetch ${chunkUrl}: ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          chunks.push(value);
+          totalBytes += value.length;
+
+          if (onProgress) {
+            onProgress(totalBytes);
+          }
+        }
+      }
+
+      const merged = new Uint8Array(totalBytes);
+      let offset = 0;
+
+      for (const chunk of chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      return merged;
+    }
+
+    try {
+      setStatus("Loading .NET runtime", 2);
+
+      const { dotnet } = await import(`${BASE}_framework/dotnet.js`);
+
+      setStatus("Initializing runtime", 8);
+
+      const runtime = await dotnet
+              .withModuleConfig({ canvas })
+              .create();
+
+      const config = runtime.getConfig();
+      const exports = await runtime.getAssemblyExports(config.mainAssemblyName);
+      const api = exports.FezGame.Program;
+
+      await runtime.runMain();
+
+      setStatus("Setting up filesystem", 12);
+      await api.PreInit(BASE);
+
+      for (let i = 0; i < CONTENT_FILES.length; i++) {
+        const file = CONTENT_FILES[i];
+        const loadPercent = 15 + Math.round((i / CONTENT_FILES.length) * 70);
+        const writePercent = 15 + Math.round(((i + 0.5) / CONTENT_FILES.length) * 70);
+
+        setStatus(
+                `Downloading game content (${i + 1}/${CONTENT_FILES.length})...`,
+                loadPercent,
+                `${file.label} — downloading chunks`
+        );
+
+        const data = await downloadChunkedFile(`${BASE}${file.url}`, (bytes) => {
+          detailEl.textContent = `${file.label} — ${formatSize(bytes)}`;
+        });
+        const blob = new Blob([data]);
+        const blobUrl = URL.createObjectURL(blob);
+
+        setStatus(
+                `Writing ${file.label} to filesystem...`,
+                writePercent,
+                `${file.label} — ${formatSize(data.length)}`
+        );
+
+        await api.DownloadContentFile(blobUrl, file.dest);
+        URL.revokeObjectURL(blobUrl);
+      }
+
+      setStatus("Content loaded", 88);
+
+      setStatus("Initializing game", 90);
+      const dpr = window.devicePixelRatio || 1;
+      const width = Math.round(canvas.clientWidth * dpr) || 1280;
+      const height = Math.round(canvas.clientHeight * dpr) || 720;
+
+      await api.Init(width, height);
+
+      setStatus("Starting FEZ", 98);
+      loadingEl.classList.add("hidden");
+      canvas.focus();
+
+      try {
+        await navigator.keyboard?.lock();
+      } catch {
+      }
+
+      console.log("[FEZ] Starting game loop");
+
+      const mainLoop = async () => {
+        try {
+          const keepRunning = await api.MainLoop();
+
+          if (keepRunning) {
+            requestAnimationFrame(mainLoop);
+            return;
+          }
+
+          console.log("[FEZ] Game requested exit");
+          await api.Cleanup();
+        } catch (error) {
+          console.error("[FEZ] MainLoop error:", error);
+          setStatus(
+                  `Error: ${error.message}`,
+                  0,
+                  "Check browser console (F12) for details."
+          );
+          loadingEl.classList.remove("hidden");
+        }
+      };
+
+      requestAnimationFrame(mainLoop);
+    } catch (error) {
+      console.error("Fatal error:", error);
+      setStatus(
+              `Error: ${error.message}`,
+              0,
+              "Check browser console (F12) for details."
+      );
+    }
+  })();
+</script>
+</body>
+</html>
